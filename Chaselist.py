@@ -1,5 +1,6 @@
 import os
 import re
+from typing import Tuple
 from typing import Optional, List
 
 import pandas as pd
@@ -11,6 +12,15 @@ import win32com.client as win32
 
 BASE_FOLDER = r"C:\Users\bram.gerrits\Desktop\Automations\Chaselist Madelon"
 CHASE_PREFIX = "Chase"  # bestand begint met "Chase"
+
+NL_TXT_FILE = os.path.join(BASE_FOLDER, "NL.txt")
+EN_TXT_FILE = os.path.join(BASE_FOLDER, "EN.txt")
+
+with open(NL_TXT_FILE, "r", encoding="utf-8") as f:
+    NL_TEMPLATE = f.read()
+
+with open(EN_TXT_FILE, "r", encoding="utf-8") as f:
+    EN_TEMPLATE = f.read()
 
 SUPPLIER_INFO_FILE = os.path.join(BASE_FOLDER, "Leveranciers informatie.xlsx")
 
@@ -29,7 +39,6 @@ COLUMN_MAPPING = [
     ("Huidige leverdatum", "Current delivery date"),
     ("Gewenste leverdatum","Requested delivery date"),
 ]
-
 
 # ───────────────────────────────────────────────────────────
 # HULPFUNCTIES BESTAND / SHEET
@@ -139,73 +148,211 @@ def load_supplier_info(path: str) -> Optional[pd.DataFrame]:
     return pd.read_excel(path)
 
 
+def format_4022_item(val) -> str:
+    """
+    Als artikel begint met 4022 → zet om naar 4022.xxx.xxxxx(x)
+    Voorbeeld: '402243612012' → '4022.436.12012'
+    """
+    if pd.isna(val):
+        return ""
+    s = str(val)
+    # haal alles behalve cijfers weg (voor het geval er spaties of andere troep inzit)
+    digits = "".join(ch for ch in s if ch.isdigit())
+
+    if not digits.startswith("4022") or len(digits) <= 7:
+        # niks doen als het geen 4022-code is of te kort
+        return s
+
+    eerste = digits[:4]       # 4022
+    tweede = digits[4:7]      # 3 cijfers
+    rest = digits[7:]         # alles erna (5 of 6 cijfers)
+
+    return f"{eerste}.{tweede}.{rest}"
+
+
 # ───────────────────────────────────────────────────────────
-# MAIL OPBOUW
+# MAIL OPBOUW – TABEL
 # ───────────────────────────────────────────────────────────
 
 def make_html_table_for_group(group: pd.DataFrame) -> str:
-    """
-    Bouwt een HTML-tabel met kolommen volgens COLUMN_MAPPING.
-    'Current delivery date' wordt rood/vet als < vandaag.
-    """
-    # Eerst checken of alle bronkolommen bestaan
+    import html
+
     missing = [src for src, _ in COLUMN_MAPPING if src not in group.columns]
     if missing:
         raise KeyError(f"Kolommen ontbreken in data: {missing}")
 
-    # Voor datumvergelijking
     today = pd.Timestamp.today().normalize()
 
-    # Bouw header
-    header_cells = "".join(f"<th>{display}</th>" for _, display in COLUMN_MAPPING)
-    rows_html = []
+    # Build header row
+    header_cells = ""
+    for _, display in COLUMN_MAPPING:
+        header_cells += (
+            f"<th style='border:1px solid #999; background-color:#d8edf7; "
+            f"padding:6px; text-align:left; font-weight:bold;'>{html.escape(display)}</th>"
+        )
 
-    for _, row in group.iterrows():
-        cells_html = []
+    # Build body rows
+    rows_html = ""
+    for row_idx, (_, row) in enumerate(group.iterrows()):
+        bg_color = "#f9f9f9" if (row_idx % 2 == 0) else "#ffffff"
+        row_cells = ""
         for src_name, display_name in COLUMN_MAPPING:
-            value = row[src_name]
+            val = row[src_name]
+            if src_name == "Artikel":
+                val = format_4022_item(val)
 
-            # Default: gewoon value tonen
-            cell_html = f"{'' if pd.isna(value) else value}"
+            dt = pd.to_datetime(val, dayfirst=True, errors="coerce")
+            val_str = dt.strftime("%d-%m-%Y") if pd.notna(dt) else ("" if pd.isna(val) else str(val))
+            val_str = html.escape(val_str)
 
-            # Speciale format voor 'Current delivery date'
-            if display_name == "Current delivery date":
-                # probeer datum te parsen (NL formaat dd-mm-jjjj)
-                dt = pd.to_datetime(value, dayfirst=True, errors="coerce")
-                if pd.notna(dt) and dt.normalize() < today:
-                    cell_html = f'<span style="color:red; font-weight:bold;">{value}</span>'
+            # Highlight overdue date
+            if display_name == "Current delivery date" and pd.notna(dt) and dt.normalize() < today:
+                val_str = f"<b><font color='red'>{val_str}</font></b>"
 
-            cells_html.append(f"<td>{cell_html}</td>")
+            row_cells += f"<td style='border:1px solid #999; padding:6px; vertical-align:top;'>{val_str}</td>"
 
-        row_html = "<tr>" + "".join(cells_html) + "</tr>"
-        rows_html.append(row_html)
+        rows_html += f"<tr style='background-color:{bg_color};'>{row_cells}</tr>"
 
+    # Return final HTML table (no thead, all clean markup)
     table_html = f"""
-    <table border="0" cellspacing="0" cellpadding="4" style="border-collapse:collapse;">
-        <thead style="background-color:#d8edf7; font-weight:bold;">
-            <tr>{header_cells}</tr>
-        </thead>
-        <tbody>
-            {''.join(rows_html)}
-        </tbody>
+    <table border="1" cellspacing="0" cellpadding="4" 
+           style="border-collapse:collapse; width:auto; font-family:Arial, sans-serif; font-size:9pt;">
+        <tr>{header_cells}</tr>
+        {rows_html}
     </table>
-    """
+    """.strip()
+
     return table_html
 
+
+# ───────────────────────────────────────────────────────────
+# OUTLOOK
+# ───────────────────────────────────────────────────────────
 
 def get_outlook() -> win32.CDispatch:
     return win32.Dispatch("Outlook.Application")
 
 
-def send_mail(to_addr: str, subject: str, html_body: str):
-    outlook = get_outlook()
+def send_mail(to_addr: str, subject: str, html_body_without_signature: str):
+    outlook = win32.Dispatch("Outlook.Application")
     mail = outlook.CreateItem(0)  # olMailItem
+
     mail.To = to_addr
     mail.Subject = subject
-    mail.HTMLBody = html_body
-    # Tijdens testen:
+
+    # Ensure HTML format
+    mail.BodyFormat = 2  # 2 = olFormatHTML
+
+    # Retrieve the signature properly
     mail.Display()
-    # Later eventueel: mail.Send()
+    signature_html = mail.HTMLBody
+
+    # Wrap full HTML document properly
+    final_html = f"""
+    <html>
+    <head>
+    <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+    <style>
+        table, th, td {{
+            border-collapse: collapse;
+            border: 1px solid #999;
+            font-family: Arial, sans-serif;
+            font-size: 9pt;
+        }}
+        th {{
+            background-color: #d8edf7;
+            text-align: left;
+            padding: 6px;
+        }}
+        td {{
+            padding: 6px;
+        }}
+    </style>
+    </head>
+    <body>
+    {html_body_without_signature}
+    <br>
+    {signature_html}
+    </body>
+    </html>
+    """
+
+    # Assign to HTMLBody AFTER setting format
+    mail.HTMLBody = final_html
+
+    mail.Display()  # to preview before sending
+
+
+# ───────────────────────────────────────────────────────────
+# TEMPLATE-HELPERS
+# ───────────────────────────────────────────────────────────
+
+def detect_language_and_name(
+    supplier_info: Optional[pd.DataFrame],
+    supplier_str: str,
+    candidates: Optional[pd.DataFrame] = None
+) -> Tuple[str, str]:
+
+    """
+    Bepaal taal (NL / ENG) en aanspreeknaam (<naam>) op basis van Leveranciers informatie.
+    """
+    lang = "NL"
+    contact_name = supplier_str
+
+    if supplier_info is None:
+        return lang, contact_name
+
+    if candidates is None or candidates.empty:
+        return lang, contact_name
+
+    # Kolomnamen zoeken
+    lang_col = None
+    name_col = None
+    for col in supplier_info.columns:
+        cname = str(col).strip().lower()
+        if lang_col is None and cname in {"eng/nl", "engnl", "taal", "language"}:
+            lang_col = col
+        if name_col is None and any(word in cname for word in ["contact", "naam", "name"]):
+            name_col = col
+
+    # Taal ophalen
+    if lang_col is not None:
+        lang_val = str(candidates.iloc[0][lang_col]).strip().upper()
+        if lang_val in {"ENG", "EN"}:
+            lang = "ENG"
+        else:
+            lang = "NL"
+
+    # Naam ophalen
+    if name_col is not None:
+        nm = str(candidates.iloc[0][name_col]).strip()
+        if nm:
+            contact_name = nm
+
+    return lang, contact_name
+
+
+def build_body_from_template(
+    lang: str,
+    contact_name: str,
+    html_table: str
+) -> str:
+    template = NL_TEMPLATE if lang != "ENG" else EN_TEMPLATE
+
+    # 1) placeholders <naam> en <handtekening> vervangen in de TEXT
+    body = template
+    body = body.replace("<naam>", contact_name)
+    body = body.replace("<handtekening>", "")
+
+    # 2) linebreaks in de tekst omzetten naar <br>, ZONDER tabel erin
+    body = body.replace("\r\n", "\n").replace("\r", "\n")
+    body = body.replace("\n", "<br>\n")
+
+    # 3) nu pas de HTML-tabel invoegen, ongewijzigd
+    body = body.replace("<tafel>", html_table)
+
+    return body
+
 
 
 # ───────────────────────────────────────────────────────────
@@ -250,7 +397,7 @@ def main():
     supplier_col = get_supplier_column(df_filtered)
     print(f"→ Leverancier-kolom: {supplier_col}")
 
-    # 7) Leveranciers-info (voor later, nu nog niet gebruikt)
+    # 7) Leveranciers-info
     supplier_info = load_supplier_info(SUPPLIER_INFO_FILE)
 
     # 8) Per leverancier mail opbouwen
@@ -261,43 +408,46 @@ def main():
 
         print(f"→ Verwerken leverancier: {supplier_str} (rows: {len(group)})")
 
-        # E-mailadres
-        if TESTMODE:
-            to_email = TEST_EMAIL
-        else:
-            to_email = TEST_EMAIL  # fallback
-            if supplier_info is not None:
-                mask = (
-                    supplier_info.iloc[:, 0]
-                    .astype(str).str.strip().str.lower()
-                    == supplier_str.lower()
-                )
-                candidates = supplier_info[mask]
-                if not candidates.empty:
-                    to_email = str(candidates.iloc[0, 1])
+        # Basis e-mailadres en kandidaat-rij in leveranciers-info
+        to_email = TEST_EMAIL if TESTMODE else TEST_EMAIL  # fallback
+        candidates = None
 
-        # Alleen relevante kolommen meenemen
+        if supplier_info is not None:
+            mask = (
+                supplier_info.iloc[:, 0]
+                .astype(str).str.strip().str.lower()
+                == supplier_str.lower()
+            )
+            candidates = supplier_info[mask]
+            if not candidates.empty and not TESTMODE:
+                # In real-mode halen we e-mail uit kolom 2
+                to_email = str(candidates.iloc[0, 1])
+
+        # Taal + aanspreeknaam bepalen
+        lang, contact_name = detect_language_and_name(
+            supplier_info=supplier_info,
+            supplier_str=supplier_str,
+            candidates=candidates
+        )
+
+        # Tabel maken
         html_table = make_html_table_for_group(group)
 
-        body = f"""
-        <html>
-        <body style="font-family: Aptos, Aptos, sans-serif; font-size: 10pt;">
-            <p>Hi,</p>
-            <p>Onderstaand vind je een overzicht van de openstaande bestelling(en) voor leverancier
-               <b>{supplier_str}</b> uit de chaselist.</p>
-            {html_table}
-            <p>Kun je laten weten wat de status is?</p>
-            <p>Alvast dank!</p>
-            <p>Vriendelijke groet,<br>
-               Bram</p>
-            <p style="font-size: 8pt; color: #777;">[Automatisch verstuurd vanuit Python-chaselist]</p>
-        </body>
-        </html>
-        """
+        # Tekst uit juiste template
+        body_without_signature = build_body_from_template(
+            lang=lang,
+            contact_name=contact_name,
+            html_table=html_table
+        )
 
-        subject = f"Chaselist – openstaande bestelling(en) {supplier_str}"
-        print(f"→ Mail klaarzetten naar: {to_email} | Subject: {subject}")
-        send_mail(to_email, subject, body)
+        # Subject per taal
+        if lang == "ENG":
+            subject = f"Chaselist – open purchase order(s) {supplier_str}"
+        else:
+            subject = f"Chaselist – openstaande bestelling(en) {supplier_str}"
+
+        print(f"→ Mail ({lang}) klaarzetten naar: {to_email} | Subject: {subject}")
+        send_mail(to_email, subject, body_without_signature)
 
     print("✔ Script afgerond.")
 
